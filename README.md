@@ -519,23 +519,58 @@ When `--instance <name>` is used, the same files live under `~/.wechat-acp/insta
 
 ## Development
 
-For local development:
+Requires Node.js 20 or later. Install, build and run the built CLI:
 
 ```bash
 npm install
 npm run build
-```
-
-Run the built CLI locally:
-
-```bash
 node dist/bin/wechat-acp.js --help
 ```
 
-Watch mode:
+Watch mode (recompiles `src/` and `bin/` into `dist/` on change; re-run the CLI in another terminal after each change):
 
 ```bash
 npm run dev
+```
+
+### Testing
+
+```bash
+npm test                 # all unit tests (node:test runner, via tsx — no build needed)
+node --import tsx/esm --test tests/config.test.ts        # a single file
+node --import tsx/esm --test --test-name-pattern="opencode2" tests/config.test.ts
+```
+
+`npm test` compiles nothing; it runs the TypeScript sources directly, so a stale `dist/` never hides a failing change. Note that `tests/bridge-new-session.test.ts` deliberately uses a relative `stateFile`, which leaves a `state.json` in the repository root after a run — it is untracked noise and safe to delete.
+
+CI (`.github/workflows/ci.yml`) runs `npm ci && npm run build && npm test` on every push and pull request.
+
+### Debugging the bridge without WeChat
+
+Running the full bridge needs a WeChat QR login. For most changes you do not need it:
+
+- **Agent presets / ACP wire behaviour** — drive the real `SessionManager` directly from `dist/` with a script (see `SessionManager` in `src/acp/session.ts`; `spawnAgent` honours the same `detached` + own-process-group setup the daemon uses). Preset names are validated before `bridge.start()`, so a bad `--agent` value fails fast without a login, while a valid one (e.g. `--agent opencode2`) proceeds straight to the WeChat QR prompt.
+- **Shutdown / process cleanup** — fake daemons with `node -e '...process.on("SIGTERM", ...)'` plus an isolated `--instance` (see "Running multiple instances") exercise `wechat-acp stop` end to end; the daemon-side shutdown deadline can be reached with `node --import <hook>` overriding `WeChatAcpBridge.prototype.start/stop` on the main thread (a `--loader` hook runs on a separate thread and will not affect the entrypoint).
+- **Injecting messages** — `wechat-acp inject --text "..."` queues a local message for a running daemon without sending a real WeChat message (`--file`, `--to`, `--context-token` are documented in `--help`).
+
+Useful switches while iterating:
+
+- `WECHAT_ACP_TELEMETRY=0` disables telemetry.
+- `WECHAT_ACP_STOP_GRACE_MS=<ms>` shortens how long `wechat-acp stop` waits before escalating to SIGKILL (default 15000), so shutdown tests do not stall.
+- `-v, --verbose` enables verbose logging.
+- Daemon stdout/stderr go to `daemon.logFile` (`~/.wechat-acp/wechat-acp.log`, or under `instances/<name>/` with `--instance`).
+
+### Repository layout
+
+```text
+bin/wechat-acp.ts     CLI entrypoint: arg parsing, daemon start/stop/status, inject
+src/config.ts         Config loading, built-in agent presets (BUILT_IN_AGENTS)
+src/bridge.ts         WeChatAcpBridge — orchestration (login, routing, shutdown)
+src/acp/              ACP client: session.ts (SessionManager), agent-manager.ts (process spawn/kill)
+src/weixin/           WeChat/iLink login and messaging
+src/inject/           Local message injection queue
+src/telemetry/        App Insights telemetry (opt-out via WECHAT_ACP_TELEMETRY=0)
+tests/                node:test unit tests (run from source via tsx)
 ```
 
 ## Telemetry
