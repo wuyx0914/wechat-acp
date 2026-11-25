@@ -3,13 +3,49 @@ import { test } from "node:test";
 
 import {
   BRIDGE_COMMANDS,
+  BUILT_IN_AGENTS,
   buildAgentSessionScope,
   defaultConfig,
   matchBridgeCommand,
   parseResourceInlineLimit,
   parseSessionResumePolicy,
+  resolveAgentSelection,
   validateCommandAliases,
 } from "../src/config.js";
+
+test("opencode presets target v1 and v2 through distinct npm packages", () => {
+  // OpenCode 1 (opencode-ai) and OpenCode 2 (@opencode/cli) both install the
+  // `opencode` command and are never side by side, so each preset must pin
+  // its own npm package and go through npx rather than a global binary.
+  const v1 = resolveAgentSelection("opencode");
+  assert.deepEqual(v1, {
+    id: "opencode",
+    label: "OpenCode",
+    command: "npx",
+    args: ["opencode-ai", "acp"],
+    env: undefined,
+    source: "preset",
+  });
+
+  const v2 = resolveAgentSelection("opencode2");
+  assert.deepEqual(v2, {
+    id: "opencode2",
+    label: "OpenCode 2",
+    command: "npx",
+    args: ["@opencode/cli", "acp"],
+    env: undefined,
+    source: "preset",
+  });
+
+  // Both expose `acp` as the last argument so the ACP stdio server starts.
+  assert.equal(BUILT_IN_AGENTS.opencode.args.at(-1), "acp");
+  assert.equal(BUILT_IN_AGENTS.opencode2.args.at(-1), "acp");
+  // Distinct preset IDs keep persisted session scopes from colliding.
+  assert.notEqual(
+    buildAgentSessionScope({ preset: "opencode", command: "npx", args: [], cwd: "." }),
+    buildAgentSessionScope({ preset: "opencode2", command: "npx", args: [], cwd: "." }),
+  );
+});
 
 test("preset session scope ignores bundled command changes", () => {
   const first = buildAgentSessionScope({

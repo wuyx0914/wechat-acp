@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add the `opencode2` built-in agent preset for OpenCode 2, the ground-up
+  TypeScript rewrite published on npm as `@opencode/cli` (v2.0.0+). It resolves
+  to `npx @opencode/cli acp`, which exposes the same ACP wire contract as v1
+  (`opencode-ai`), so it works with the existing session, config-option,
+  cancellation, HTTP MCP `attach_file`, and resume paths without further
+  changes. The existing `opencode` preset keeps targeting v1 and is unchanged.
+  Both major versions use the same `opencode` command name and are not installed
+  side by side, so the preset runs v2 through `npx` instead of the global binary.
+
 - Limit `--hide-images` and `agent.showImages: false` to inline images emitted
   by tool calls, including Copilot CLI `rawOutput` fallbacks and embedded image
   resources. Explicit agent message images and attached `resource_link` images

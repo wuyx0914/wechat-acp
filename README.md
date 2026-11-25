@@ -73,6 +73,7 @@ Current presets:
 - `qwen`
 - `codex`
 - `opencode`
+- `opencode2`
 - `openclaw`
 - `kiro`
 - `hermes`
