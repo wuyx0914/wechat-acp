@@ -11,6 +11,17 @@
   Both major versions use the same `opencode` command name and are not installed
   side by side, so the preset runs v2 through `npx` instead of the global binary.
 
+- Make `wechat-acp stop` and daemon shutdown reliable when teardown gets stuck
+  (#44). `stop` used to delete the PID file and print "Stopped" immediately
+  after sending SIGTERM, so a daemon hung in shutdown went unnoticed while its
+  agent process trees stayed alive. It now waits up to 15s for the daemon to
+  exit (override with `WECHAT_ACP_STOP_GRACE_MS`), escalates to SIGKILL, and
+  only removes the PID file once the process is really gone; it also cleans up
+  non-numeric PID files instead of sending signals to PID `NaN`. The daemon's
+  own `shutdown()` now has a 30s hard deadline so a hung `bridge.stop()` or
+  telemetry flush can no longer prevent `process.exit()`, and repeated
+  signals no longer re-enter shutdown. Adds `tests/e2e-stop-cleanup.sh`.
+
 - Limit `--hide-images` and `agent.showImages: false` to inline images emitted
   by tool calls, including Copilot CLI `rawOutput` fallbacks and embedded image
   resources. Explicit agent message images and attached `resource_link` images

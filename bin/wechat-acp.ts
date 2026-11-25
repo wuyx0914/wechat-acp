@@ -39,6 +39,13 @@ import {
 } from "../src/telemetry/index.js";
 import packageJson from "../package.json" with { type: "json" };
 
+/**
+ * Hard upper bound for the daemon's graceful shutdown. Per-agent teardown
+ * is parallel and capped at `killAgentAndWait`'s 6s default, so 30s leaves
+ * ample room for telemetry flush while still guaranteeing `process.exit()`.
+ */
+const SHUTDOWN_DEADLINE_MS = 30_000;
+
 function usage(): void {
   const presets = listBuiltInAgents()
     .map(({ id }) => id)
@@ -291,18 +298,22 @@ function handleAgents(config: WeChatAcpConfig): void {
   }
 }
 
-function handleStop(config: WeChatAcpConfig): void {
+async function handleStop(config: WeChatAcpConfig): Promise<void> {
   const pidFile = config.daemon.pidFile;
   if (!fs.existsSync(pidFile)) {
     console.log("No daemon running (no PID file found)");
     return;
   }
 
-  const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+  const pid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    fs.unlinkSync(pidFile);
+    console.log(`Invalid PID file contents; cleaned up ${pidFile}`);
+    return;
+  }
+
   try {
     process.kill(pid, "SIGTERM");
-    fs.unlinkSync(pidFile);
-    console.log(`Stopped daemon (PID ${pid})`);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ESRCH") {
       fs.unlinkSync(pidFile);
@@ -310,7 +321,71 @@ function handleStop(config: WeChatAcpConfig): void {
     } else {
       console.error(`Failed to stop daemon: ${String(err)}`);
     }
+    return;
   }
+
+  // Wait for the daemon to actually exit before declaring success. The
+  // daemon's own shutdown tears down every ACP agent process group, which
+  // can take several seconds; reporting "Stopped" right after SIGTERM
+  // used to hide a daemon that was stuck in shutdown (issue #44).
+  const exited = await waitForExit(pid, STOP_GRACE_MS);
+  if (exited) {
+    fs.unlinkSync(pidFile);
+    console.log(`Stopped daemon (PID ${pid})`);
+    return;
+  }
+
+  // Still alive after the grace period: escalate so the user is never left
+  // with a stuck daemon plus orphaned agent process trees.
+  console.error(`Daemon (PID ${pid}) did not exit within ${STOP_GRACE_MS / 1000}s; sending SIGKILL`);
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+      console.error(`Failed to kill daemon: ${String(err)}`);
+      return;
+    }
+  }
+  if (await waitForExit(pid, 2_000)) {
+    fs.unlinkSync(pidFile);
+    console.log(`Killed daemon (PID ${pid})`);
+  } else {
+    console.error(`Daemon (PID ${pid}) is still running after SIGKILL; pid file left in place`);
+  }
+}
+
+/**
+ * How long `wechat-acp stop` waits for the daemon to exit on its own before
+ * escalating to SIGKILL. Override with WECHAT_ACP_STOP_GRACE_MS (ms).
+ */
+const STOP_GRACE_MS = parsePositiveInt(process.env.WECHAT_ACP_STOP_GRACE_MS) ?? 15_000;
+
+function parsePositiveInt(raw: string | undefined): number | undefined {
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+  if (!isRunning(pid)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (!isRunning(pid) || Date.now() - startedAt >= timeoutMs) {
+        clearInterval(timer);
+        resolve(!isRunning(pid));
+      }
+    }, 100);
+  });
 }
 
 function handleStatus(config: WeChatAcpConfig): void {
@@ -492,7 +567,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args.command === "stop") {
-    handleStop(config);
+    await handleStop(config);
     return;
   }
   if (args.command === "status") {
@@ -581,10 +656,31 @@ async function main(): Promise<void> {
   });
 
   // Handle graceful shutdown
+  let shuttingDown = false;
   const shutdown = async (reason: "signal" | "error" | "normal") => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     trackEvent("app.stop", { reason, uptimeSec: Math.round((Date.now() - startedAt) / 1000) });
-    await bridge.stop();
+
+    // Hard deadline: bridge.stop() tears down every ACP agent process group
+    // (up to several seconds each) and flushes telemetry. If any step hangs,
+    // process.exit() below would never run and `wechat-acp stop` would be
+    // left with a daemon that never exits (issue #44). Every agent already
+    // runs in its own process group and has received SIGTERM by the time the
+    // deadline fires, so exiting here does not orphan them.
+    const deadline = setTimeout(() => {
+      console.error(`Shutdown exceeded ${SHUTDOWN_DEADLINE_MS / 1000}s; forcing exit`);
+      process.exit(reason === "error" ? 1 : 0);
+    }, SHUTDOWN_DEADLINE_MS);
+    deadline.unref();
+
+    try {
+      await bridge.stop();
+    } catch (err) {
+      console.error(`Bridge cleanup failed during shutdown: ${String(err)}`);
+    }
     await shutdownTelemetry();
+    clearTimeout(deadline);
     process.exit(reason === "error" ? 1 : 0);
   };
   process.on("SIGINT", () => void shutdown("signal"));
