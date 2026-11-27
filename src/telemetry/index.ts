@@ -34,6 +34,7 @@ export type EventName =
   | "command.acp_cancel"
   | "command.acp_new"
   | "command.acp_more"
+  | "command.acp_glm"
   | "command.buffer_start"
   | "command.buffer_done"
   | "session.created"

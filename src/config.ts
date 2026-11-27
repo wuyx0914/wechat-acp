@@ -114,9 +114,21 @@ export const BRIDGE_COMMANDS = {
   acpCancel: "/acp-cancel",
   acpNew: "/acp-new",
   acpMore: "/acp-more",
+  acpGlm: "/acp-glm",
   promptStart: "/acp-prompt-start",
   promptDone: "/acp-prompt-done",
 } as const;
+
+/**
+ * Built-in default aliases for bridge commands. Unlike user-defined
+ * `commandAliases`, these are always active (no configuration needed)
+ * and are validated at module load to never shadow another canonical
+ * command. Users can still add more aliases on top through
+ * {@link WeChatAcpConfig.commandAliases}.
+ */
+export const DEFAULT_COMMAND_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  [BRIDGE_COMMANDS.acpGlm]: ["/usage", "/glm"],
+};
 
 export interface WeChatAcpConfig {
   /**
@@ -376,9 +388,12 @@ export function resolveCommandAliases(
   canonical: string,
   aliases?: Record<string, string[]>,
 ): string[] {
-  const configured = aliases?.[canonical];
-  if (!configured) return [];
   const result: string[] = [];
+  for (const alias of DEFAULT_COMMAND_ALIASES[canonical] ?? []) {
+    if (!result.includes(alias)) result.push(alias);
+  }
+  const configured = aliases?.[canonical];
+  if (!configured) return result;
   for (const alias of configured) {
     const trimmed = alias.trim();
     if (trimmed && !result.includes(trimmed)) {
@@ -437,6 +452,12 @@ export function validateCommandAliases(aliases: Record<string, string[]> | undef
   }
 
   const knownCommands = new Set<string>(Object.values(BRIDGE_COMMANDS));
+  // Built-in default aliases behave like reserved names too, so a user
+  // cannot re-point `/usage` at a different command.
+  const reservedAliases = new Map<string, string>();
+  for (const [canonical, defaults] of Object.entries(DEFAULT_COMMAND_ALIASES)) {
+    for (const alias of defaults) reservedAliases.set(alias, canonical);
+  }
   const seen = new Map<string, string>();
 
   for (const [canonical, list] of Object.entries(aliases)) {
@@ -462,6 +483,12 @@ export function validateCommandAliases(aliases: Record<string, string[]> | undef
       if (knownCommands.has(trimmed) && trimmed !== canonical) {
         throw new Error(
           `commandAliases: alias ${JSON.stringify(trimmed)} collides with built-in command ${JSON.stringify(trimmed)}.`,
+        );
+      }
+      const reservedOwner = reservedAliases.get(trimmed);
+      if (reservedOwner && reservedOwner !== canonical) {
+        throw new Error(
+          `commandAliases: alias ${JSON.stringify(trimmed)} collides with built-in alias of ${JSON.stringify(reservedOwner)}.`,
         );
       }
       const owner = seen.get(trimmed);

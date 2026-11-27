@@ -12,6 +12,13 @@ import { startMonitor } from "./weixin/monitor.js";
 import { sendTextMessage, uploadImageMedia, sendImageItem, uploadFileMedia, sendFileItem, splitText, TEXT_CHUNK_LIMIT } from "./weixin/send.js";
 import type { UploadedImageMedia, UploadedFileMedia } from "./weixin/send.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
+import {
+  describeQuotaWindow,
+  fetchUsageSnapshot,
+  UsageConfigError,
+  type QuotaLimitItem,
+  type QuotaLimitResponse,
+} from "./weixin/usage.js";
 import { TypingStatus, MessageType } from "./weixin/types.js";
 import type { WeixinMessage } from "./weixin/types.js";
 import {
@@ -50,6 +57,7 @@ const ACP_CONFIG_COMMAND = BRIDGE_COMMANDS.acpConfig;
 const ACP_CANCEL_COMMAND = BRIDGE_COMMANDS.acpCancel;
 const ACP_NEW_COMMAND = BRIDGE_COMMANDS.acpNew;
 const ACP_MORE_COMMAND = BRIDGE_COMMANDS.acpMore;
+const ACP_GLM_COMMAND = BRIDGE_COMMANDS.acpGlm;
 const BUFFER_START_COMMAND = BRIDGE_COMMANDS.promptStart;
 const BUFFER_DONE_COMMAND = BRIDGE_COMMANDS.promptDone;
 const BUFFER_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -476,6 +484,11 @@ export class WeChatAcpBridge {
       return;
     }
 
+    if (this.extractBridgeCommand(msg, ACP_GLM_COMMAND)) {
+      await this.handleAcpGlmCommand(userId, contextToken, generation);
+      return;
+    }
+
     // /acp-prompt-start — enter buffering mode
     if (this.isBufferStartCommand(msg)) {
       this.handleBufferStart(userId, contextToken, generation);
@@ -856,6 +869,142 @@ export class WeChatAcpBridge {
       if (!isCurrent()) return;
       this.cancelTypingIndicator(userId, contextToken).catch(() => {});
     });
+  }
+
+  /**
+   * `/acp-glm` (aliases `/usage`, `/glm`): query GLM / Z.ai account
+   * quota directly over HTTP and reply with a friendly text report.
+   * Never touches the agent, so it works without an active ACP session
+   * and costs no tokens.
+   */
+  protected async handleAcpGlmCommand(
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
+    const isCurrent = () =>
+      this.isMessageGenerationCurrent(userId, generation);
+    const env = this.config.agent.env ?? {};
+    const baseUrl = env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL ?? "";
+    const token = env.ANTHROPIC_AUTH_TOKEN ?? process.env.ANTHROPIC_AUTH_TOKEN ?? "";
+
+    let reply: string;
+    let ok = false;
+    let platform = "unknown";
+    try {
+      if (!token) {
+        throw new UsageConfigError(
+          "ANTHROPIC_AUTH_TOKEN is not set. Add it to the agent `env` in config.json " +
+            "(or export it before starting wechat-acp).",
+        );
+      }
+      if (!baseUrl) {
+        throw new UsageConfigError(
+          "ANTHROPIC_BASE_URL is not set. Add it to the agent `env` in config.json " +
+            "(or export it before starting wechat-acp).",
+        );
+      }
+      const snapshot = await fetchUsageSnapshot({ baseUrl, token });
+      platform = snapshot.platform;
+      ok = snapshot.errors.length === 0;
+      reply = this.formatGlmUsage(snapshot.platform, snapshot.quota, snapshot.errors);
+    } catch (err) {
+      reply = this.formatGlmUsageError(err instanceof Error ? err.message : String(err));
+    }
+    if (!isCurrent()) return;
+    trackEvent(
+      "command.acp_glm",
+      { userIdHash: hashUserId(userId), platform, ok },
+      hashUserId(userId),
+    );
+    // sendReply serialises itself onto the per-user send chain; do not wrap
+    // this in queueSendTask as well or the nested send deadlocks on itself.
+    await this.sendReply(userId, contextToken, reply);
+    if (!isCurrent()) return;
+    this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+  }
+
+  private formatGlmUsage(
+    platform: string,
+    quota: QuotaLimitResponse | null,
+    errors: string[],
+  ): string {
+    const lines: string[] = [];
+    const title = quota?.level
+      ? `📊 **GLM Usage** · ${platform} · ${quota.level}`
+      : `📊 **GLM Usage** · ${platform}`;
+    lines.push(title);
+    lines.push("");
+    if (quota && quota.limits.length > 0) {
+      for (const item of quota.limits) {
+        lines.push(
+          `• ${describeQuotaWindow(item)}  ${this.formatPercentage(item.percentage)} ${this.usageBar(item.percentage)}`,
+        );
+        const reset = this.formatResetCountdown(item.nextResetTime);
+        if (reset) lines.push(`   ↻ resets in ${reset}`);
+        const detail = this.formatMcpDetails(item);
+        if (detail) lines.push(detail);
+      }
+      lines.push("");
+    }
+    if (errors.length > 0) {
+      lines.push("⚠️ Some data could not be fetched:");
+      for (const msg of errors) {
+        lines.push(`   ${msg}`);
+      }
+      lines.push("");
+    }
+    if (!quota && errors.length === 0) {
+      lines.push("No quota data returned.");
+    }
+    lines.push(`_${new Date().toLocaleString("zh-CN", { hour12: false })}_`);
+    return lines.join("\n");
+  }
+
+  private formatGlmUsageError(message: string): string {
+    return [
+      "❌ **GLM Usage**",
+      "",
+      message,
+      "",
+      "Check `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in the agent env, then retry.",
+    ].join("\n");
+  }
+
+  /** API returns whole percentages (`13` → `13%`); clamp for safety. */
+  private formatPercentage(value: number | undefined): string {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "n/a";
+    const pct = Math.max(0, Math.min(100, value));
+    return `${pct.toFixed(pct % 1 === 0 ? 0 : 1)}%`;
+  }
+
+  private usageBar(percentage: number | undefined): string {
+    if (typeof percentage !== "number" || !Number.isFinite(percentage)) return "";
+    const filled = Math.round((Math.max(0, Math.min(100, percentage)) / 100) * 10);
+    return "█".repeat(filled) + "░".repeat(10 - filled);
+  }
+
+  /** Epoch ms → human countdown like `4h 12m`; empty when absent/past. */
+  private formatResetCountdown(epochMs: number | undefined): string {
+    if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return "";
+    const remaining = epochMs - Date.now();
+    if (remaining <= 0) return "";
+    const totalMin = Math.floor(remaining / 60_000);
+    const days = Math.floor(totalMin / 1440);
+    const hours = Math.floor((totalMin % 1440) / 60);
+    const mins = totalMin % 60;
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m`;
+  }
+
+  /** `TIME_LIMIT` rows list per-tool usage; render only the non-zero ones. */
+  private formatMcpDetails(item: QuotaLimitItem): string {
+    if (item.type !== "TIME_LIMIT" || !Array.isArray(item.usageDetails)) return "";
+    const used = item.usageDetails.filter((d) => (d.usage ?? 0) > 0);
+    if (used.length === 0) return "";
+    const parts = used.map((d) => `${d.modelCode ?? "unknown"} ${d.usage}`);
+    return `   ↳ ${parts.join(", ")}`;
   }
 
   private formatAcpCancelResult(

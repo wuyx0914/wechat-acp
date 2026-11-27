@@ -228,10 +228,13 @@ command to one or more custom aliases via the `commandAliases` config map:
   "commandAliases": {
     "/acp-cancel": ["/cancel", "/取消", "取消"],
     "/acp-config": ["/config", "/设置"],
-    "/acp-new": ["/acp-clear", "/new"]
+    "/acp-new": ["/acp-clear", "/new"],
+    "/acp-glm": ["/quota"]
   }
 }
 ```
+
+Aliases are additive: the canonical name always keeps working. `/acp-glm` additionally ships with the built-in aliases `/usage` and `/glm`, which are reserved and cannot be mapped to another command.
 
 With this config:
 
@@ -345,6 +348,37 @@ Notes:
 - Runtime bridge changes take effect on the next agent turn. They do not change a turn that is already running.
 - This command is handled by `wechat-acp` itself and is **not** forwarded to the underlying agent.
 - You can give this command your own aliases via `commandAliases` (see [Customizing bridge command names](#customizing-bridge-command-names-aliases)).
+
+## GLM usage command
+
+`wechat-acp` ships a bridge-level command for checking GLM / Z.ai Coding Plan quota without waking the agent. It calls the provider's usage endpoint directly over HTTP (no LLM turn, no tokens spent) and replies with a friendly text report:
+
+```text
+/acp-glm
+/usage
+/glm
+```
+
+The three names are built in and always work. Example reply:
+
+```text
+📊 **GLM Usage** · ZHIPU · pro
+
+• Tokens · 5h window  13% █░░░░░░░░░
+   ↻ resets in 2h 4m
+• Tokens · weekly window  20% ██░░░░░░░░
+   ↻ resets in 1d 3h
+• MCP · monthly  0% ░░░░░░░░░░
+   ↻ resets in 15d 22h
+   ↳ web-reader 7
+```
+
+Notes:
+
+- The endpoint is chosen from `ANTHROPIC_BASE_URL`: `api.z.ai` → Z.ai, `open.bigmodel.cn` / `dev.bigmodel.cn` → ZHIPU. Requests are authenticated with `ANTHROPIC_AUTH_TOKEN`. Both are read from the agent `env` in `config.json` first, then from the bridge process environment, so the same credentials the agent already uses are reused.
+- The command works without an active ACP session and is handled by `wechat-acp` itself — it is **not** forwarded to the underlying agent.
+- Missing credentials, unsupported base URLs, and upstream HTTP errors are reported as a plain-text error reply instead of failing silently.
+- `/usage` and `/glm` are reserved: you cannot re-point them at another command through `commandAliases`. You can still add extra aliases for `/acp-glm`.
 
 ## WeChat ACP cancel command
 
