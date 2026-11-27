@@ -1,0 +1,33 @@
+{
+  "commandAliases": {
+    "/acp-cancel": ["/cancel", "/取消", "取消"],
+    "/acp-config": ["/config", "/设置"],
+    "/acp-new": ["/acp-clear", "/new"],
+    "/acp-weather": ["/weather", "/今日天气"],
+    "/acp-repos": ["/repos", "/热门仓库"]
+  },
+  "agent": {
+    "preset": "opencode2",
+    "cwd": "/path/to/your/project",
+    "city": "厦门",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+      "ANTHROPIC_AUTH_TOKEN": "<YOUR_API_KEY>"
+    }
+  },
+  "agents": {
+    "opencode2": {
+      "label": "OpenCode 2 (Homebrew)",
+      "description": "OpenCode v2.4.2 from /opt/homebrew/bin/opencode",
+      "command": "/opt/homebrew/bin/opencode",
+      "args": ["acp"]
+    }
+  },
+  "session": {
+    "idleTimeoutMs": 86400000,
+    "resume": "off"
+  },
+  "storage": {
+    "inboxDir": "/path/to/your/inbox"
+  }
+}
