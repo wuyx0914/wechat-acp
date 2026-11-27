@@ -7,6 +7,8 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 import crypto from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { login, loadToken, type TokenData } from "./weixin/auth.js";
 import { startMonitor } from "./weixin/monitor.js";
 import { sendTextMessage, uploadImageMedia, sendImageItem, uploadFileMedia, sendFileItem, splitText, TEXT_CHUNK_LIMIT } from "./weixin/send.js";
@@ -42,6 +44,7 @@ import {
   resolveCommandAliases,
 } from "./config.js";
 import { drainPendingText, PendingTextRegistry } from "./pending-text.js";
+import { REPOS_PROMPT, WEATHER_PROMPT } from "./prompts.js";
 import { InjectionMonitor } from "./inject/monitor.js";
 import type { InjectedMessage } from "./inject/types.js";
 import {
@@ -58,6 +61,11 @@ const ACP_CANCEL_COMMAND = BRIDGE_COMMANDS.acpCancel;
 const ACP_NEW_COMMAND = BRIDGE_COMMANDS.acpNew;
 const ACP_MORE_COMMAND = BRIDGE_COMMANDS.acpMore;
 const ACP_GLM_COMMAND = BRIDGE_COMMANDS.acpGlm;
+const ACP_WEATHER_COMMAND = BRIDGE_COMMANDS.acpWeather;
+const ACP_REPOS_COMMAND = BRIDGE_COMMANDS.acpRepos;
+const REPOS_SCRIPT_TIMEOUT_MS = 3 * 60_000;
+const REPOS_SCRIPT_MAX_OUTPUT_BYTES = 256 * 1024;
+const execFileAsync = promisify(execFile);
 const BUFFER_START_COMMAND = BRIDGE_COMMANDS.promptStart;
 const BUFFER_DONE_COMMAND = BRIDGE_COMMANDS.promptDone;
 const BUFFER_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -486,6 +494,16 @@ export class WeChatAcpBridge {
 
     if (this.extractBridgeCommand(msg, ACP_GLM_COMMAND)) {
       await this.handleAcpGlmCommand(userId, contextToken, generation);
+      return;
+    }
+
+    if (this.extractBridgeCommand(msg, ACP_WEATHER_COMMAND)) {
+      await this.handleAcpWeatherCommand(userId, contextToken, generation);
+      return;
+    }
+
+    if (this.extractBridgeCommand(msg, ACP_REPOS_COMMAND)) {
+      await this.handleAcpReposCommand(userId, contextToken, generation);
       return;
     }
 
@@ -922,6 +940,150 @@ export class WeChatAcpBridge {
     await this.sendReply(userId, contextToken, reply);
     if (!isCurrent()) return;
     this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+  }
+
+  /**
+   * `/acp-weather` (aliases `/weather`, `/今日天气`): delegate a
+   * self-contained weather + almanac prompt to the agent. The agent's
+   * streamed reply is delivered to WeChat through the normal session
+   * pipeline, so this only needs to enqueue the prompt.
+   */
+  protected async handleAcpWeatherCommand(
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
+    const prompt = WEATHER_PROMPT(this.config.agent.city ?? "厦门");
+    await this.enqueueAgentPromptCommand(
+      userId,
+      contextToken,
+      generation,
+      prompt,
+      "command.acp_weather",
+    );
+  }
+
+  /**
+   * `/acp-repos` (aliases `/repos`, `/热门仓库`): run the GitHub
+   * trending scraper, then hand its JSON to the agent for a Chinese
+   * digest. Mirrors the daily Hermes cron job, including the
+   * de-duplication record the script maintains.
+   */
+  protected async handleAcpReposCommand(
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
+    const script = this.config.agent.reposScript;
+    if (!script) {
+      await this.sendReply(
+        userId,
+        contextToken,
+        "⚠️ `/acp-repos` is disabled: `agent.reposScript` is not configured.",
+      );
+      return;
+    }
+
+    let output: string | undefined;
+    let scriptError: string | undefined;
+    // The scraper takes ~1 min; acknowledge immediately so the user
+    // doesn't think the command was dropped. Sent on the per-user send
+    // chain so it can never interleave with the final report.
+    await this.sendReply(
+      userId,
+      contextToken,
+      "⏳ 正在抓取 GitHub 热门仓库，约需 1 分钟…",
+    );
+    if (!this.isMessageGenerationCurrent(userId, generation)) return;
+    try {
+      output = await this.runReposScript(script);
+    } catch (err) {
+      scriptError = err instanceof Error ? err.message : String(err);
+      this.log(`[acp-repos] script failed: ${scriptError}`);
+    }
+    if (!this.isMessageGenerationCurrent(userId, generation)) return;
+
+    const prompt = REPOS_PROMPT(output ?? "", scriptError);
+    await this.enqueueAgentPromptCommand(
+      userId,
+      contextToken,
+      generation,
+      prompt,
+      "command.acp_repos",
+      scriptError ? "script_failed" : "ok",
+    );
+  }
+
+  /**
+   * Shared path for commands that turn into one agent turn: enqueue the
+   * prompt on the user's session (creating it if needed) and let the
+   * normal reply pipeline stream the answer back to WeChat.
+   */
+  private async enqueueAgentPromptCommand(
+    userId: string,
+    contextToken: string,
+    generation: number,
+    promptText: string,
+    event: "command.acp_weather" | "command.acp_repos",
+    status: "ok" | "script_failed" = "ok",
+  ): Promise<void> {
+    if (!this.sessionManager) {
+      await this.sendReply(userId, contextToken, "Bridge is not ready yet.");
+      return;
+    }
+    const isCurrent = () => this.isMessageGenerationCurrent(userId, generation);
+    this.beginAgentPrompt(userId, contextToken);
+    trackEvent(
+      event,
+      { userIdHash: hashUserId(userId), status },
+      hashUserId(userId),
+    );
+    await this.sessionManager.enqueue(userId, {
+      prompt: [{ type: "text", text: promptText }],
+      contextToken,
+      replyGeneration: generation,
+    });
+    if (!isCurrent()) return;
+    this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+  }
+
+  /**
+   * Execute the trending scraper and return its stdout. The script is
+   * a local file path from config; it is run through the interpreter
+   * matching its extension so users can swap in a Node scraper too.
+   */
+  private async runReposScript(script: string): Promise<string> {
+    const [cmd, args] = this.resolveScriptCommand(script);
+    const { stdout } = await execFileAsync(cmd, args, {
+      timeout: REPOS_SCRIPT_TIMEOUT_MS,
+      maxBuffer: REPOS_SCRIPT_MAX_OUTPUT_BYTES,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    return stdout;
+  }
+
+  private resolveScriptCommand(script: string): [string, string[]] {
+    const ext = script.toLowerCase().endsWith(".py")
+      ? "py"
+      : script.toLowerCase().endsWith(".sh")
+        ? "sh"
+        : script.toLowerCase().endsWith(".js") || script.toLowerCase().endsWith(".mjs")
+          ? "js"
+          : null;
+    switch (ext) {
+      case "py":
+        return ["python3", [script]];
+      case "sh":
+        return ["bash", [script]];
+      case "js":
+        return ["node", [script]];
+      default:
+        throw new Error(
+          `Unsupported reposScript extension for ${JSON.stringify(script)}. ` +
+            "Expected .py, .sh, .js or .mjs.",
+        );
+    }
   }
 
   private formatGlmUsage(

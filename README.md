@@ -234,7 +234,7 @@ command to one or more custom aliases via the `commandAliases` config map:
 }
 ```
 
-Aliases are additive: the canonical name always keeps working. `/acp-glm` additionally ships with the built-in aliases `/usage` and `/glm`, which are reserved and cannot be mapped to another command.
+Aliases are additive: the canonical name always keeps working. `/acp-glm` additionally ships with the built-in aliases `/usage` and `/glm`, `/acp-weather` with `/weather` and `/今日天气`, and `/acp-repos` with `/repos` and `/热门仓库` — all of which are reserved and cannot be mapped to another command.
 
 With this config:
 
@@ -348,6 +348,34 @@ Notes:
 - Runtime bridge changes take effect on the next agent turn. They do not change a turn that is already running.
 - This command is handled by `wechat-acp` itself and is **not** forwarded to the underlying agent.
 - You can give this command your own aliases via `commandAliases` (see [Customizing bridge command names](#customizing-bridge-command-names-aliases)).
+
+## On-demand weather and trending commands
+
+Two bridge commands replay the daily Hermes reports on request. Unlike `/acp-glm`, these **do** start an agent turn: the bridge builds a self-contained prompt, enqueues it on the user's session, and the agent's answer streams back to WeChat through the normal reply pipeline.
+
+```text
+/acp-weather
+/weather
+/今日天气
+```
+
+Sends a weather + almanac prompt for the configured city. The agent fetches `wttr.in` and almanac sources with its own web tools and replies in three compact sections: 「天气」「建议」「今日黄历」.
+
+```text
+/acp-repos
+/repos
+/热门仓库
+```
+
+Runs the GitHub trending scraper first, then hands its JSON to the agent for a Chinese Top10 digest. The bridge immediately acknowledges with `⏳ 正在抓取 GitHub 热门仓库，约需 1 分钟…` because the scrape takes roughly a minute; the digest follows when the agent finishes.
+
+Notes:
+
+- `agent.city` sets the city for `/acp-weather` (default `厦门`).
+- `agent.reposScript` points at the scraper (default `~/.hermes/scripts/github_trending_top100.py`). The interpreter is picked from the extension: `.py` → `python3`, `.sh` → `bash`, `.js`/`.mjs` → `node`. Set it to `null` to disable the command; the bridge then replies with a short notice instead of running anything.
+- The scraper keeps its own de-duplication record, so a manual `/repos` after the morning cron usually reports 「今日无新上榜仓库」. This is expected: manual and scheduled runs share the same record.
+- If the scraper fails, the agent is still asked to reply, but with an explicit 「⚠️ 今日抓取失败」 instruction so it never fabricates repositories.
+- All six aliases are built in and reserved. Extra aliases can be added via `commandAliases` (see [Customizing bridge command names](#customizing-bridge-command-names-aliases)).
 
 ## GLM usage command
 

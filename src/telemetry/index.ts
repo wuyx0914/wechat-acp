@@ -35,6 +35,8 @@ export type EventName =
   | "command.acp_new"
   | "command.acp_more"
   | "command.acp_glm"
+  | "command.acp_weather"
+  | "command.acp_repos"
   | "command.buffer_start"
   | "command.buffer_done"
   | "session.created"

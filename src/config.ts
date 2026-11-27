@@ -115,6 +115,8 @@ export const BRIDGE_COMMANDS = {
   acpNew: "/acp-new",
   acpMore: "/acp-more",
   acpGlm: "/acp-glm",
+  acpWeather: "/acp-weather",
+  acpRepos: "/acp-repos",
   promptStart: "/acp-prompt-start",
   promptDone: "/acp-prompt-done",
 } as const;
@@ -128,6 +130,8 @@ export const BRIDGE_COMMANDS = {
  */
 export const DEFAULT_COMMAND_ALIASES: Readonly<Record<string, readonly string[]>> = {
   [BRIDGE_COMMANDS.acpGlm]: ["/usage", "/glm"],
+  [BRIDGE_COMMANDS.acpWeather]: ["/weather", "/今日天气"],
+  [BRIDGE_COMMANDS.acpRepos]: ["/repos", "/热门仓库"],
 };
 
 export interface WeChatAcpConfig {
@@ -180,6 +184,17 @@ export interface WeChatAcpConfig {
      * text resource. Defaults to 1000 characters.
      */
     resourceInlineLimit?: number;
+    /**
+     * City used by the `/acp-weather` command. Defaults to `厦门`.
+     */
+    city?: string;
+    /**
+     * Absolute path to the GitHub trending scraper invoked by
+     * `/acp-repos`. Its stdout (JSON) is fed to the agent as context.
+     * Defaults to `~/.hermes/scripts/github_trending_top100.py`.
+     * Set to `null` to disable the command with a clear error.
+     */
+    reposScript?: string | null;
   };
   agents: Record<string, AgentPreset>;
   session: {
@@ -265,6 +280,8 @@ export function defaultConfig(opts?: { instance?: string }): WeChatAcpConfig {
       showAudio: true,
       showResources: true,
       resourceInlineLimit: DEFAULT_RESOURCE_INLINE_LIMIT,
+      city: "厦门",
+      reposScript: path.join(os.homedir(), ".hermes", "scripts", "github_trending_top100.py"),
     },
     agents: { ...BUILT_IN_AGENTS },
     session: {
