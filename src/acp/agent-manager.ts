@@ -2,7 +2,7 @@
  * Spawn and manage ACP agent subprocesses.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import packageJson from "../../package.json" with { type: "json" };
@@ -337,15 +337,30 @@ async function killPosixProcessGroup(
   pid: number,
   timeoutMs: number,
 ): Promise<void> {
-  if (!signalPosixProcessGroup(pid, "SIGTERM")) return;
+  // Some agents (e.g. OpenCode v2) call setsid() in their children, so
+  // every descendant lives in its own process group and signalling `-pid`
+  // alone leaves them orphaned. Snapshot the whole descendant tree first,
+  // collect every distinct pgid, then signal each group.
+  const descendants = listPosixDescendants(pid);
+  const groups = new Set<number>([pid]);
+  for (const child of descendants) groups.add(child.pgid);
+  for (const group of groups) {
+    if (!signalPosixProcessGroup(group, "SIGTERM")) groups.delete(group);
+  }
+
   const startedAt = Date.now();
   const forceAfterMs = Math.min(5_000, Math.max(0, timeoutMs - 100));
   let forceSent = false;
 
-  while (isPosixProcessGroupRunning(pid)) {
+  while (isPosixProcessGroupRunning(pid) || [...groups].some(isPosixProcessGroupRunning)) {
     const elapsed = Date.now() - startedAt;
     if (!forceSent && elapsed >= forceAfterMs) {
-      if (!signalPosixProcessGroup(pid, "SIGKILL")) return;
+      for (const group of groups) {
+        if (!signalPosixProcessGroup(group, "SIGKILL")) groups.delete(group);
+      }
+      // Belt and braces: descendants that escaped the group signal (e.g.
+      // they changed pgid again after the snapshot) are killed by pid.
+      for (const child of descendants) killPosixPid(child.pid, "SIGKILL");
       forceSent = true;
     }
     if (elapsed >= timeoutMs) {
@@ -354,6 +369,63 @@ async function killPosixProcessGroup(
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+interface PosixProcessRow {
+  pid: number;
+  ppid: number;
+  pgid: number;
+}
+
+/**
+ * List every descendant of `rootPid` together with its process group id.
+ * Reads the process table once and walks the parent/child graph breadth
+ * first, so grandchildren that called setsid() and live in their own
+ * session/process group are still found. Returns an empty list when the
+ * table cannot be read (non-Darwin/Linux or `ps` unavailable).
+ */
+export function listPosixDescendants(rootPid: number): PosixProcessRow[] {
+  if (process.platform !== "darwin" && process.platform !== "linux") return [];
+  let output: string;
+  try {
+    output = execFileSync("ps", ["-axo", "pid=,ppid=,pgid="], {
+      encoding: "utf8",
+      timeout: 2_000,
+    });
+  } catch {
+    return [];
+  }
+  const childrenOf = new Map<number, PosixProcessRow[]>();
+  for (const line of output.split("\n")) {
+    const fields = line.trim().split(/\s+/).map(Number);
+    if (fields.length !== 3 || !fields.every(Number.isInteger)) continue;
+    const [pid, ppid, pgid] = fields;
+    const list = childrenOf.get(ppid) ?? [];
+    list.push({ pid, ppid, pgid });
+    childrenOf.set(ppid, list);
+  }
+  const result: PosixProcessRow[] = [];
+  const queue = [rootPid];
+  const visited = new Set<number>([rootPid]);
+  while (queue.length > 0) {
+    const parent = queue.shift()!;
+    for (const child of childrenOf.get(parent) ?? []) {
+      if (visited.has(child.pid)) continue;
+      visited.add(child.pid);
+      result.push(child);
+      queue.push(child.pid);
+    }
+  }
+  return result;
+}
+
+function killPosixPid(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(pid, signal);
+  } catch (err) {
+    if (hasErrorCode(err, "ESRCH")) return;
+    throw err;
   }
 }
 
